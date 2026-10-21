@@ -1,11 +1,13 @@
 """查询词的窗口写入 txt，搭配统计另写入一个文件。
 
 命中行是前后各 10 个词，查询词不加 << >>，存 collocate/{折叠词}.txt。
+一次传入的多个词视为同一个节点，折叠形式用 + 接成文件名。
 搭配只在这次取出的命中上计算，左右各 5 个词，词先折叠再计数，存 collocate/{折叠词}_pmi.txt。
 标点不进表。门槛与 countLeftRightPmi.py 相同。
 """
 
 import argparse
+import heapq
 import math
 import sys
 import time
@@ -53,22 +55,69 @@ def pmi(ab_freq, a_freq, b_freq, corpus_size):
         return float("-inf")
 
 
-def gather(con, word, limit, names):
-    key = fold(word)
+def distinct_folds(words):
+    """按输入顺序折叠。折成同一个形式的只留第一次。"""
+    keys = []
+    seen = set()
+    for word in words:
+        key = fold(word)
+        if key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return keys
+
+
+def postings_for(con, key, limit):
+    """取出一个折叠形式最靠前的出现位置，不读句子文本。
+
+    key 已经折叠过。forms 表用折叠形式查到词条编号；没有这个形式就返回空列表。
+    出现记录不在这张表里，而在 postings 里按词条编号存成一块字节。
+    那一块按语料、句子、位置编码，iter_postings 按这个顺序解开，数到 limit 条就停。
+    返回的是 (语料号, 句子号, 句中位置)，后面再按这些编号去读句子。
+    """
     row = con.execute("SELECT id FROM forms WHERE fold = ?", (key,)).fetchone()
     if row is None:
-        return key, []
+        return []
     blob = con.execute(
         "SELECT data FROM postings WHERE form_id = ?",
         (row[0],),
     ).fetchone()
     if blob is None:
-        return key, []
+        return []
+    return list(iter_postings(blob[0], limit))
+
+
+def gather(con, words, limit, names):
+    """多个词视为一个节点，返回 (文件名主干, 命中列表)。
+
+    先把输入折成形式，重复的去掉，再用 + 接成文件名主干。
+    每个形式的出现记录已经按语料、句子、位置排好。各取自己最靠前的 limit 条。
+    库里没有的形式就是一条空流，文件名里仍保留它。
+
+    这些流再按同一顺序混成一条。混完只留前 limit 条，所以节点一共只有这么多命中。
+    某个形式若排在自己的第 limit 条之后，它前面至少已经有 limit 条自己的出现，
+    合并后也到不了前 limit 名，一开始不取它是安全的。
+
+    位置名单定下来之后才去读句子，避免把将被丢掉的命中也读出来。
+    一次只读事务里把这些句子取完，读完就回滚。
+    每条命中是：语料名、前后各 10 词的窗口、整句折叠后的词、查询词在句中的下标。
+    """
+    keys = distinct_folds(words)
+    stem = "+".join(keys)
+    streams = [postings_for(con, key, limit) for key in keys]
+    streams = [stream for stream in streams if stream]
+    chosen = []
+    # 各流内部已经有序，merge 按语料、句子、位置往外出，不必先合成一张大表再排序。
+    for corpus, s_id, pos in heapq.merge(*streams):
+        chosen.append((corpus, s_id, pos))
+        if len(chosen) >= limit:
+            break
     hits = []
     sent_sql = "SELECT tokens FROM sentences WHERE corpus = ? AND s_id = ?"
     con.execute("BEGIN")
     try:
-        for corpus, s_id, pos in iter_postings(blob[0], limit):
+        for corpus, s_id, pos in chosen:
             sent = con.execute(sent_sql, (corpus, s_id)).fetchone()
             if sent is None:
                 raise SystemExit(f"句子不在库里：语料 {corpus} 句号 {s_id}")
@@ -77,7 +126,7 @@ def gather(con, word, limit, names):
             hits.append((names[corpus], format_window(tokens, pos), folded, pos))
     finally:
         con.execute("ROLLBACK")
-    return key, hits
+    return stem, hits
 
 
 def tally(hits, pmi_limit):
@@ -217,14 +266,14 @@ def main(argv=None):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
-        description="把查询窗口写入 collocate/{折叠词}.txt，搭配统计写入 collocate/{折叠词}_pmi.txt。"
+        description="把查询窗口写入 collocate/{折叠词}.txt，搭配统计写入 collocate/{折叠词}_pmi.txt。多个词视为同一个节点。"
     )
-    parser.add_argument("words", nargs="+", help="1 到 5 个词")
+    parser.add_argument("words", nargs="+", help="1 到 5 个词，多个词视为同一个节点")
     parser.add_argument(
         "--limit",
         type=int,
         default=50000,
-        help="每个词最多取多少条，默认 50000",
+        help="合并后的节点最多取多少条，默认 50000",
     )
     parser.add_argument(
         "--pmi-limit",
@@ -241,20 +290,20 @@ def main(argv=None):
     OUT_DIR.mkdir(exist_ok=True)
     con = connect()
     names = dict(con.execute("SELECT id, name FROM corpora"))
-    for word in args.words:
-        started = time.perf_counter()
-        key, hits = gather(con, word, args.limit, names)
-        hits_path = OUT_DIR / f"{key}.txt"
-        pmi_path = OUT_DIR / f"{key}_pmi.txt"
-        write_hits(hits_path, hits)
-        write_pmi(pmi_path, tally(hits, args.pmi_limit))
-        elapsed = time.perf_counter() - started
-        print(
-            f"（{word} 折叠为 {key}，返回 {len(hits)} 条，上限 {args.limit}，"
-            f"PMI 下限 {args.pmi_limit:g}，写入 {hits_path.name} 和 {pmi_path.name}，"
-            f"{elapsed:.2f} 秒）",
-            file=sys.stderr,
-        )
+    started = time.perf_counter()
+    stem, hits = gather(con, args.words, args.limit, names)
+    hits_path = OUT_DIR / f"{stem}.txt"
+    pmi_path = OUT_DIR / f"{stem}_pmi.txt"
+    write_hits(hits_path, hits)
+    write_pmi(pmi_path, tally(hits, args.pmi_limit))
+    elapsed = time.perf_counter() - started
+    label = "、".join(args.words)
+    print(
+        f"（{label} 折叠为 {stem}，返回 {len(hits)} 条，上限 {args.limit}，"
+        f"PMI 下限 {args.pmi_limit:g}，写入 {hits_path.name} 和 {pmi_path.name}，"
+        f"{elapsed:.2f} 秒）",
+        file=sys.stderr,
+    )
     con.close()
 
 
