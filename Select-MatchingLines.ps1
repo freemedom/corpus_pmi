@@ -8,6 +8,7 @@
 正则的转义和量词保持原义，只折叠字面字符。œ+ 会折成 (?:oe)+。
 方括号里的 œ 会变成 o 和 e 两个字符。
 命中行按原文输出。-Count 默认 5，0 表示不截断。
+直接在控制台运行且有输出行时，按 C 把这些行复制到剪贴板，按 Enter 结束。
 
 .EXAMPLE
 .\Select-MatchingLines.ps1 -Path .\monde.txt -Pattern "partout dans"
@@ -69,7 +70,32 @@ catch {
 }
 
 $result = [FrenchTcf.Collocate.TextFold]::Search($item.FullName, $regex, $Count)
-foreach ($line in $result.Lines) {
+if ($null -eq $result.Lines) {
+    $printedLines = @()
+}
+else {
+    $printedLines = @($result.Lines)
+}
+foreach ($line in $printedLines) {
     Write-Output $line
 }
-Write-Host ("命中 {0} 条，输出 {1} 条" -f $result.Matched, $result.Lines.Length)
+Write-Host ("命中 {0} 条，输出 {1} 条" -f $result.Matched, $printedLines.Count)
+if ($printedLines.Count -gt 0 -and -not [Console]::IsOutputRedirected -and -not [Console]::IsInputRedirected) {
+    Write-Host ("按 C 复制这 {0} 行，按 Enter 结束" -f $printedLines.Count)
+    while ($true) {
+        try {
+            $key = [Console]::ReadKey($true)
+        }
+        catch {
+            break
+        }
+        if ($key.Key -eq [ConsoleKey]::Enter) {
+            break
+        }
+        if ($key.Key -eq [ConsoleKey]::C) {
+            Set-Clipboard -Value $printedLines
+            Write-Host "已复制"
+            break
+        }
+    }
+}
